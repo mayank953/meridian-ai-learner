@@ -1,0 +1,258 @@
+name: Deploy to GCP Cloud Run
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  REGION: us-central1
+  SERVICE_NAME: meridian-ai-cloud-run
+  IMAGE_NAME: gcr.io/${{ secrets.GCP_PROJECT_ID }}/meridian-ai-cloud-run
+  VECTOR_BUCKET: gs://${{ secrets.GCP_PROJECT_ID }}-vector-staging
+  INDEX_NAME: financial-docs-production
+  ENDPOINT_NAME: financial-docs-endpoint
+
+jobs:
+  deploy:
+    name: Provision & Deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_CREDENTIALS_JSON }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+
+      # --- Phase 1: Enable APIs ---
+      - name: Enable Required GCP APIs
+        run: |
+          gcloud services enable \
+            aiplatform.googleapis.com \
+            run.googleapis.com \
+            secretmanager.googleapis.com \
+            storage.googleapis.com \
+            logging.googleapis.com \
+            monitoring.googleapis.com \
+            cloudtrace.googleapis.com \
+            artifactregistry.googleapis.com \
+            bigquery.googleapis.com \
+            cloudbuild.googleapis.com \
+            cloudresourcemanager.googleapis.com \
+            iam.googleapis.com \
+            generativelanguage.googleapis.com
+            
+          echo "Waiting 90 seconds for API enablement to fully propagate across GCP..."
+          sleep 90
+
+      # --- Phase 2: Storage Buckets ---
+      - name: Ensure Storage Buckets Exist
+        run: |
+          # Check and create Vector Staging Bucket
+          if ! gcloud storage buckets describe ${{ env.VECTOR_BUCKET }} >/dev/null 2>&1; then
+            echo "Creating vector staging bucket..."
+            gcloud storage buckets create ${{ env.VECTOR_BUCKET }} --location=${{ env.REGION }} --uniform-bucket-level-access --public-access-prevention
+          else
+            echo "Vector bucket already exists."
+          fi
+
+      # --- Phase 3: Vector Search Provisioning ---
+      - name: Ensure Initial Embeddings File Exists
+        run: |
+          # Generate file if it wasn't committed to repo
+          python generate_json.py
+          gcloud storage cp init_embeddings.json ${{ env.VECTOR_BUCKET }}/index-data/
+
+      - name: Provision Vector Search Index & Endpoint
+        timeout-minutes: 90 # Increased since deployments can be slow
+        run: |
+          # 0. Generate metadata
+          cat <<EOF > index_metadata.json
+          {
+            "contentsDeltaUri": "${{ env.VECTOR_BUCKET }}/index-data",
+            "config": {
+              "dimensions": 768,
+              "approximateNeighborsCount": 150,
+              "distanceMeasureType": "DOT_PRODUCT_DISTANCE",
+              "shardSize": "SHARD_SIZE_MEDIUM",
+              "algorithm_config": {
+                "treeAhConfig": {
+                  "leafNodeEmbeddingCount": 1000,
+                  "leafNodesToSearchPercent": 10
+                }
+              }
+            }
+          }
+          EOF
+
+          # 1. Ensure Index Exists
+          INDEX_ID=$(gcloud ai indexes list --region=${{ env.REGION }} --format="value(name)" --filter="displayName=${{ env.INDEX_NAME }}" --limit=1)
+
+          if [ -z "$INDEX_ID" ]; then
+            echo "Creating Vector Search Index. This command waits synchronously (~25-30 min)..."
+            gcloud ai indexes create \
+              --display-name=${{ env.INDEX_NAME }} \
+              --metadata-file=index_metadata.json \
+              --index-update-method=STREAM_UPDATE \
+              --region=${{ env.REGION }} \
+              --project=${{ env.PROJECT_ID }}
+            
+            
+            echo "Index creation Started. Looking up resource ID..."
+
+            for attempt in $(seq 1 45); do
+              # We check if the deployment is fully complete by looking for the index in the endpoint
+              INDEX_ID=$(gcloud ai indexes list --region=${{ env.REGION }} --format="value(name)" --filter="displayName=${{ env.INDEX_NAME }}" --limit=1)
+              
+              if [ -n "$INDEX_ID" ]; then
+                echo "Created Index: $INDEX_ID"
+                break
+              fi
+              
+              echo "Attempt $attempt/45: Index Creation in progress... waiting 60 seconds."
+              sleep 60
+            done
+            
+            echo "Created Index: $INDEX_ID"
+          else
+            echo "Index already exists: $INDEX_ID"
+          fi
+
+          
+
+          # 2. Ensure Endpoint Exists
+          ENDPOINT_ID=$(gcloud ai index-endpoints list --region=${{ env.REGION }} --format="value(name)" --filter="displayName=${{ env.ENDPOINT_NAME }}" --limit=1)
+
+          if [ -z "$ENDPOINT_ID" ]; then
+            echo "Creating Vector Search Endpoint..."
+            gcloud ai index-endpoints create \
+              --display-name=${{ env.ENDPOINT_NAME }} \
+              --region=${{ env.REGION }} \
+              --project=${{ env.PROJECT_ID }}
+            
+            ENDPOINT_ID=$(gcloud ai index-endpoints list --region=${{ env.REGION }} --format="value(name)" --filter="displayName=${{ env.ENDPOINT_NAME }}" --limit=1)
+            echo "Created Endpoint: $ENDPOINT_ID"
+            sleep 60
+          else
+            echo "Endpoint already exists: $ENDPOINT_ID"
+          fi
+
+          # 3. Ensure Index is Deployed to Endpoint
+          IS_DEPLOYED=$(gcloud ai index-endpoints describe $ENDPOINT_ID --region=${{ env.REGION }} --format="value(deployedIndexes.id)" 2>/dev/null | grep "deployed_financial_docs" || true)
+
+          if [ -z "$IS_DEPLOYED" ]; then
+            echo "Triggering Index Deployment to Endpoint. (Async operation)..."
+            gcloud ai index-endpoints deploy-index $ENDPOINT_ID \
+              --deployed-index-id=deployed_financial_docs \
+              --display-name=financial-docs-deployed \
+              --index=$INDEX_ID \
+              --region=${{ env.REGION }} \
+              --project=${{ env.PROJECT_ID }}
+            echo "Wait up to 45 minutes for deployment to finish..."
+            for attempt in $(seq 1 45); do
+              # We check if the deployment is fully complete by looking for the index in the endpoint
+              IS_DEPLOYED_NOW=$(gcloud ai index-endpoints describe $ENDPOINT_ID --region=${{ env.REGION }} --format="value(deployedIndexes.id)" 2>/dev/null | grep "deployed_financial_docs" || true)
+              
+              if [ -n "$IS_DEPLOYED_NOW" ]; then
+                echo "Index deployment is complete and ACTIVE on the endpoint!"
+                break
+              fi
+              
+              echo "Attempt $attempt/45: Deployment in progress... waiting 60 seconds."
+              sleep 60
+            done
+            
+            if [ -z "$IS_DEPLOYED_NOW" ]; then
+              echo "WARNING: Deployment timed out after 45 minutes. It may still be running."
+              # We don't exit 1 here because GCP might just be slow, and Cloud Run *might* still be able to start.
+            fi
+          else
+            echo "Index is already deployed."
+          fi
+
+          # Final Validation and Export
+          echo "INDEX_ID=$INDEX_ID" >> $GITHUB_ENV
+          echo "ENDPOINT_ID=$ENDPOINT_ID" >> $GITHUB_ENV
+
+          # 4. Clean up the dummy bootstrap datapoint
+          echo "Removing dummy init_0001 datapoint from index..."
+          gcloud ai indexes remove-datapoints $INDEX_ID \
+            --datapoint-ids=init_0001 \
+            --region=${{ env.REGION }} 2>/dev/null || echo "init_0001 already removed or not found. Continuing..."
+
+      # --- Phase 4: Secrets ---
+      - name: Ensure Secret Manager Has API Key
+        env:
+          # Passed as an environment variable (not pasted into the script text) so the key never appears in the shell command
+          RAW_GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+        run: |
+          # Create secret container if it doesn't exist
+          if ! gcloud secrets describe GOOGLE_API_KEY >/dev/null 2>&1; then
+            echo "Creating GOOGLE_API_KEY secret container..."
+            gcloud secrets create GOOGLE_API_KEY --replication-policy="automatic"
+          fi
+
+          # Sanitize: strip all whitespace, newlines, carriage returns
+          CLEAN_KEY=$(echo -n "$RAW_GOOGLE_API_KEY" | tr -d '[:space:]')
+          echo "API Key length after sanitization: ${#CLEAN_KEY} characters"
+
+          # Add the sanitized value as a new secret version
+          echo -n "$CLEAN_KEY" | gcloud secrets versions add GOOGLE_API_KEY --data-file=-
+          echo "Successfully updated GOOGLE_API_KEY with the sanitized GitHub Secret value."
+
+          # Grant Cloud Run service account access to Secret Manager
+          echo "Granting Secret Manager permissions to Cloud Run Service Account..."
+          PROJECT_NUMBER=$(gcloud projects describe ${{ env.PROJECT_ID }} --format="value(projectNumber)")
+          # Least privilege: grant access to this one secret, not every secret in the project
+          gcloud secrets add-iam-policy-binding GOOGLE_API_KEY \
+            --member="serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com" \
+            --role="roles/secretmanager.secretAccessor" >/dev/null
+
+      # --- Phase 5: Build & Deploy Application ---
+      - name: Build and Push Docker Image
+        run: |
+          gcloud builds submit --tag ${{ env.IMAGE_NAME }} .
+
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run deploy ${{ env.SERVICE_NAME }} \
+            --image ${{ env.IMAGE_NAME }} \
+            --region ${{ env.REGION }} \
+            --platform managed \
+            --allow-unauthenticated \
+            --port 8080 \
+            --max-instances 3 \
+            --set-env-vars="ENVIRONMENT=production,GCP_PROJECT_ID=${{ env.PROJECT_ID }},GCP_REGION=${{ env.REGION }},GCS_BUCKET_NAME=${{ env.PROJECT_ID }}-vector-staging,GCS_PREFIX=uploads/,VERTEX_LLM_MODEL_NAME=gemini-3.8-flash,VERTEX_EMBEDDING_MODEL_NAME=text-embedding-005,VECTOR_SEARCH_INDEX_ID=${{ env.INDEX_ID }},VECTOR_SEARCH_INDEX_ENDPOINT_ID=${{ env.ENDPOINT_ID }}" \
+            --update-secrets="GOOGLE_API_KEY=GOOGLE_API_KEY:latest"
+
+      - name: Allow Public Access to Cloud Run
+        run: |
+          echo "--- Granting run.admin role to deployer service account ---"
+          PROJECT_NUMBER=$(gcloud projects describe ${{ env.PROJECT_ID }} --format="value(projectNumber)")
+          DEPLOYER_SA=$(gcloud config get account 2>/dev/null)
+          echo "Deployer SA: $DEPLOYER_SA"
+
+          gcloud projects add-iam-policy-binding ${{ env.PROJECT_ID }} \
+            --member="serviceAccount:${DEPLOYER_SA}" \
+            --role="roles/run.admin" --quiet >/dev/null 2>&1 || true
+
+          echo "--- Setting allUsers invoker binding on Cloud Run service ---"
+          gcloud run services add-iam-policy-binding ${{ env.SERVICE_NAME }} \
+            --region=${{ env.REGION }} \
+            --member="allUsers" \
+            --role="roles/run.invoker" \
+            --quiet
+
+          echo "--- Verifying IAM policy ---"
+          gcloud run services get-iam-policy ${{ env.SERVICE_NAME }} \
+            --region=${{ env.REGION }}

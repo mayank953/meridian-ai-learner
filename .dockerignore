@@ -1,0 +1,30 @@
+# Python bytecode (stale Windows-compiled .pyc files break Linux containers)
+__pycache__/
+*.py[codz]
+*$py.class
+
+# Environment & credentials (injected via Cloud Run env vars / Secret Manager)
+.env
+.env.*
+credentials/
+
+# Git
+.git/
+.github/
+.gitignore
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Docs & misc
+README.md
+logs/
+*.log
+.meridian/
+
+# Node (frontend build happens inside Docker)
+frontend/node_modules/
+frontend/dist/
