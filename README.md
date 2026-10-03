@@ -9,7 +9,31 @@ It is built to **learn from**. The company in the examples, *Aldermoor Industrie
 
 > The "checks" in the audit are done by the AI from its general knowledge (only the exchange-rate check uses a live data source). This is a demo of how such a system is built, **not** a real compliance tool.
 
-**Jump to:** [Technologies](#the-technologies-in-plain-words) · [How it fits together](#how-it-fits-together) · [Why many files?](#why-is-the-code-split-into-many-files) · [What is in this repo](#whats-in-this-repo) · [Run it on your computer](#run-it-on-your-computer) · [Why the cloud?](#why-would-you-need-the-cloud) · [Settings](#settings) · [Problems](#common-problems)
+**New here? Read the [Learner Guide](docs/README.md)**: the story, every file explained, exercises and examples.
+
+**Jump to:** [Learn in depth](#learn-in-depth) · [Technologies](#the-technologies-in-plain-words) · [How it fits together](#how-it-fits-together) · [Why many files?](#why-is-the-code-split-into-many-files) · [What is in this repo](#whats-in-this-repo) · [Run it on your computer](#run-it-on-your-computer) · [Why the cloud?](#why-would-you-need-the-cloud) · [Settings](#settings) · [Problems](#common-problems)
+
+---
+
+## Learn in depth
+
+This README is the short version. The [`docs/`](docs/README.md) folder explains everything step by step:
+
+| If you want to… | Read |
+|---|---|
+| Understand the problem the app solves | [The case](docs/01-the-case.md) |
+| See how it all fits together | [The big picture](docs/02-the-big-picture.md) |
+| Learn the basic words (repo, `.env`, API…) | [Basics for newcomers](docs/03-basics-for-newcomers.md) |
+| See every folder and **why the code is split** | [Project tour](docs/04-project-tour.md) |
+| Understand every file | [Backend](docs/05-backend-files.md) · [Frontend](docs/06-frontend-files.md) · [Root files](docs/07-root-and-config-files.md) |
+| Follow a request from button to answer | [Follow a request](docs/08-follow-a-request.md) |
+| Learn FastAPI, settings and logging, RAG, agents | [09](docs/09-fastapi-explained.md) · [10](docs/10-settings-and-logging.md) · [11](docs/11-rag-explained.md) · [12](docs/12-agents-explained.md) |
+| See how it is packed and set up in the cloud | [Docker](docs/13-docker-and-cloud-run.md) · [GitHub Actions](docs/14-provisioning-and-github-actions.md) |
+| Check what you need, and the **$300 free credit** | [Requirements and costs](docs/15-requirements-accounts-costs.md) |
+| Practise | [Exercises](docs/16-exercises.md) · [runnable examples](docs/examples/README.md) |
+| Fix an error | [Troubleshooting](docs/18-troubleshooting.md) |
+
+> **Is Terraform used?** No. The cloud is set up by GitHub Actions running `gcloud` commands (see [docs/14](docs/14-provisioning-and-github-actions.md)).
 
 ---
 
@@ -121,6 +145,7 @@ frontend/                     The web page (React + TypeScript)
 └── src/lib/api.ts            The only file that talks to the backend
 
 sample_docs/                  Four made-up PDFs to try the app with
+docs/                         The learner guide (19 pages) and docs/examples/ (6 small programs)
 .github/workflows/deploy.yml  Robot that sets up the cloud and deploys the app
 Dockerfile                    Recipe to pack the app into one box
 requirements.txt              Python packages (exact versions)
